@@ -22,7 +22,6 @@ import argparse
 import urllib3
 urllib3.disable_warnings()
 
-
 def list_files(root, ffilter = lambda x: True, recurse = True):
     """ list all files matching a filter in a given dir with optional recursion. """
     for root, subdirs, files in os.walk(root):
@@ -44,8 +43,17 @@ def m2_maven_info(root):
         info['artifactId'] = rpath_parts[-2:-1][0]
         info['version'] = rpath_parts[-1:][0]
         # check for jar
-        jarfile = pom.replace('.pom', '.jar')
-        if path.isfile(jarfile):            
+        jarfile = "" #in case there are no jar files
+        for fj in os.listdir(path.dirname(pom)):
+          if fj.endswith(".jar") and not fj.endswith("-sources.jar") and  not fj.endswith("-javadoc.jar") :
+            jarfile = os.path.join(path.dirname(pom),fj)
+            if not jarfile == pom.replace('.pom', '.jar') :
+              pomBase = info['pom'].strip(".pom").strip(info['version'])
+              classifier = fj.strip(pomBase).strip(".jar")
+              if classifier :
+                info['classifier'] = classifier
+
+        if path.isfile(jarfile):
             info['jar'] = path.basename(jarfile)
             # check for sources
             sourcejar = jarfile.replace('.jar', '-sources.jar')
@@ -62,7 +70,7 @@ def nexus_postform(minfo, repo_url, files, auth, form_params, file_name):
     req = requests.post(url, allow_redirects = False, files=files, auth=auth, params=form_params, timeout = 20, verify=False)
     if req.status_code > 299:
         print ("Error communicating with Nexus!"),
-        print ("code=", str(req.status_code), ", msg=[", req.content,"]")
+        print ("code=", str(req.status_code), ", msg=[", req.content,"]", "resource=",file_name)
     else:
         print ("Successfully uploaded: ", file_name)
 
@@ -102,9 +110,11 @@ def nexus_upload(maven_info, repo_url, repo_id, credentials=None, force=False):
     if 'jar' in maven_info:
       file_name = maven_info['jar']
       fullpath = path.join(maven_info['path'], file_name)
+      classifier = maven_info['classifier'] if 'classifier' in maven_info else ""
       files |= {
         'maven2.asset2': (file_name, open(fullpath, 'rb')),
         'maven2.asset2.extension': (None, 'jar'),
+        'maven2.asset2.classifier': (None, classifier)
       }
                   
     last_artifact = last_attached_file(file_name, maven_info)
@@ -177,5 +187,5 @@ if __name__ == '__main__':
             if iartifact_pat and not iartifact_pat.search(info['archiveId']):
                 continue
             
-            print ("\nProcessing: ", (gav(info)))
+            # print ("\nProcessing: ", (gav(info)))
             nexus_upload(info, args.repo_url, args.repo_id, credentials=tuple(args.auth.split(':')), force=args.force_upload)
