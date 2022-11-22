@@ -32,6 +32,37 @@ def list_files(root, ffilter = lambda x: True, recurse = True):
                 for f in list_files(sdir, ffilter, recurse):
                     yield f
 
+#### This checks for Jars in the m2 folder that don't have accompanying pom files, which would miss them on the primary pass.
+def check_for_orphaned_jars(repo_url, repo_id, auth, root) :
+  print("Check for Orphaned Jars: ", root)
+  for jar in list_files(root, lambda x: x.endswith(".jar") and not x.endswith("-sources.jar") and not x.endswith("-javadoc.jar")):
+      rpath = path.dirname(jar).replace(root, '')
+      rpath_parts = list(filter(lambda x: x != '', rpath.split(os.sep)))
+      file_name = path.basename(jar)
+      groupId = '.'.join(rpath_parts[:-2])
+      artifactId = rpath_parts[-2:-1][0]
+      version = rpath_parts[-1:][0]
+      m2_path = "%s/%s/%s/%s" % (groupId.replace('.','/'), artifactId, version, file_name)
+
+      if not artifact_exists(repo_url, repo_id, auth, m2_path):
+        payload = { 'hasPom':'true', 'repository':repo_id }
+        files = {
+          'maven2.groupId': (None, groupId),
+          'maven2.artifactId': (None, artifactId),
+          'maven2.version': (None, version),
+          'maven2.asset1': (file_name, open(jar, 'rb')),
+          'maven2.asset1.extension': (None, 'jar'),
+        } 
+        #Note: There's no way to identify an arch classifier without a pom file.
+        url = "%s/%s" % (repo_url, 'service/rest/v1/components')
+        req = requests.post(url, allow_redirects = False, files=files, auth=auth, params=payload, timeout = 20, verify=False)        
+        if req.status_code > 299:
+          print ("Error communicating with Nexus!"),
+          print ("code=", str(req.status_code), ", msg=[", req.content,"]", "resource=",file_name)
+        else:
+          print ("Successfully uploaded: ", file_name)
+
+
 
 def m2_maven_info(root):
     """ walks an on-disk m2 repo yielding a dict of pom/gav/jar info. """
@@ -48,8 +79,8 @@ def m2_maven_info(root):
           if fj.endswith(".jar") and not fj.endswith("-sources.jar") and  not fj.endswith("-javadoc.jar") :
             jarfile = os.path.join(path.dirname(pom),fj)
             if not jarfile == pom.replace('.pom', '.jar') :
-              pomBase = info['pom'].strip(".pom").strip(info['version'])
-              classifier = fj.strip(pomBase).strip(".jar")
+              pomBase = info['pom'].replace(".pom","")
+              classifier = fj.replace(pomBase,"").replace(".jar","").lstrip("-")
               if classifier :
                 info['classifier'] = classifier
 
@@ -93,12 +124,9 @@ def last_attached_file(filename, minfo):
     m2_path = "%s/%s/%s" % (minfo['groupId'].replace('.','/'), minfo['artifactId'], minfo['version'])
     return "%s/%s"  % (m2_path, filename)
 
-def nexus_upload(maven_info, repo_url, repo_id, credentials=None, force=False):
+def nexus_upload(maven_info, repo_url, repo_id, auth=None, force=False):
 
     payload = { 'hasPom':'true', 'repository':repo_id }
-    auth = None
-    if credentials is not None:
-        auth = HTTPBasicAuth(credentials[0], credentials[1])
                 
     # append file params
     fullpath = path.join(maven_info['path'], maven_info['pom'])
@@ -108,16 +136,16 @@ def nexus_upload(maven_info, repo_url, repo_id, credentials=None, force=False):
       'maven2.asset1.extension': (None, 'pom'),
     }
     if 'jar' in maven_info:
-      file_name = maven_info['jar']
-      fullpath = path.join(maven_info['path'], file_name)
+      asset_name = maven_info['jar']
+      fullpath = path.join(maven_info['path'], asset_name)
       classifier = maven_info['classifier'] if 'classifier' in maven_info else ""
       files |= {
-        'maven2.asset2': (file_name, open(fullpath, 'rb')),
+        'maven2.asset2': (asset_name, open(fullpath, 'rb')),
         'maven2.asset2.extension': (None, 'jar'),
         'maven2.asset2.classifier': (None, classifier)
       }
                   
-    last_artifact = last_attached_file(file_name, maven_info)
+    last_artifact = last_attached_file(info['pom'], maven_info)
     if force or not artifact_exists(repo_url, repo_id, auth, last_artifact) :
       nexus_postform(maven_info, repo_url, files=files, auth=auth, form_params=payload, file_name=last_artifact)
     
@@ -151,7 +179,7 @@ def nexus_upload(maven_info, repo_url, repo_id, credentials=None, force=False):
           nexus_postform(maven_info, repo_url, files=files, auth=auth, form_params=payload, file_name=last_artifact)
 
 def gav(info):
-    return (info['groupId'], info['artifactId'], info['version'])
+    return (info['groupId'], info['artifactId'], info['version'], info['classifier'])
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Easily upload multiple artifacts to a remote Nexus server.')
@@ -176,16 +204,24 @@ if __name__ == '__main__':
     if args.include_artifact:
         iartifact_pat = re.compile(args.include_artifact)
     
-    for repo in args.repodirs:
-        print ("Uploading content from [%s] to %s repo on %s" % (repo, args.repo_id, args.repo_url))
-        for info in m2_maven_info(repo):
-            # only include specific groups if group regex supplied
-            if igroup_pat and not igroup_pat.search(info['groupId']):
-                continue
+    auth = None
+    credentials=tuple(args.auth.split(':'))
+    if credentials is not None:
+      auth = HTTPBasicAuth(credentials[0], credentials[1])
 
-            # only include specific artifact if artifact regex supplied
-            if iartifact_pat and not iartifact_pat.search(info['archiveId']):
-                continue
-            
-            # print ("\nProcessing: ", (gav(info)))
-            nexus_upload(info, args.repo_url, args.repo_id, credentials=tuple(args.auth.split(':')), force=args.force_upload)
+    for repo in args.repodirs:
+      print ("Uploading content from [%s] to %s repo on %s" % (repo, args.repo_id, args.repo_url))
+      for info in  m2_maven_info(repo):
+          # only include specific groups if group regex supplied
+          if igroup_pat and not igroup_pat.search(info['groupId']):
+              continue
+
+          # only include specific artifact if artifact regex supplied
+          if iartifact_pat and not iartifact_pat.search(info['archiveId']):
+              continue
+          
+          # print ("\nProcessing: ", (gav(info)))
+          nexus_upload(info, args.repo_url, args.repo_id, auth, force=args.force_upload)
+      
+      ## check for jarfiles without accompanying pom files. These may need to be uploaded manually
+      check_for_orphaned_jars(args.repo_url, args.repo_id, auth, repo)        
