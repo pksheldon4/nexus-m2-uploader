@@ -1,4 +1,6 @@
-# nexus-m2-uploader
+# nexus-m2-uploader. 
+
+Requires Python3.10
 
 The idea of this repo is to allow the user to upload the files from a local .m2 folder to a nexus repository.
 
